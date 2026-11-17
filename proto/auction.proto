@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package auction;
+
+option go_package = "auction/proto";
+
+// ---------- Client-facing API ----------
+
+service Auction {
+  rpc Bid(BidRequest) returns (BidResponse);
+  rpc Result(ResultRequest) returns (ResultResponse);
+
+  // ---------- Internal node-to-node API ----------
+  // Primary pushes its latest state to a backup.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // Backups ping the primary to detect crashes.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message BidRequest {
+  string bidder = 1;
+  int64 amount = 2;
+}
+
+enum Outcome {
+  SUCCESS = 0;
+  FAIL = 1;
+  EXCEPTION = 2;
+}
+
+message BidResponse {
+  Outcome outcome = 1;
+  string message = 2;
+}
+
+message ResultRequest {}
+
+message ResultResponse {
+  bool over = 1;
+  string highest_bidder = 2;
+  int64 highest_bid = 3;
+}
+
+// Full auction state, sent from primary to backups.
+message ReplicateRequest {
+  int64 seq = 1;                    // increases with every update
+  string highest_bidder = 2;
+  int64 highest_bid = 3;
+  map<string, int64> bidders = 4;   // bidder -> their highest bid so far
+  int64 end_unix_millis = 5;        // when the auction closes
+}
+
+message ReplicateResponse {
+  bool ok = 1;
+}
+
+message HeartbeatRequest {}
+
+message HeartbeatResponse {
+  int32 primary_id = 1;
+}
