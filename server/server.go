@@ -13,6 +13,7 @@ import (
 	pb "auction/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Node is one replica of the auction.
@@ -53,10 +54,32 @@ func (n *Node) Bid(ctx context.Context, req *pb.BidRequest) (*pb.BidResponse, er
 	n.highestBidder = req.Bidder
 	n.seq++
 
-	// TODO: replicate the new state to all backups and wait for their
-	// acks BEFORE replying. This is what makes the system survive a crash.
-
+	n.replicateToBackups()
 	return &pb.BidResponse{Outcome: pb.Outcome_SUCCESS}, nil
+}
+
+// Sends current state to all backups. A peer that doesn't answer within
+// the timeout is treated as crashed (allowed: we tolerate 1 failure).
+func (n *Node) replicateToBackups() {
+	state := &pb.ReplicateRequest{
+		Seq:           n.seq,
+		HighestBidder: n.highestBidder,
+		HighestBid:    n.highestBid,
+		Bidders:       n.bidders,
+		EndUnixMillis: n.endTime.UnixMilli(),
+	}
+	for _, addr := range n.peers {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if _, err := pb.NewAuctionClient(conn).Replicate(ctx, state); err != nil {
+			log.Printf("backup %s unreachable: %v", addr, err)
+		}
+		cancel()
+		conn.Close()
+	}
 }
 
 func (n *Node) Result(ctx context.Context, req *pb.ResultRequest) (*pb.ResultResponse, error) {
@@ -81,7 +104,10 @@ func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.Rep
 		n.seq = req.Seq
 		n.highestBidder = req.HighestBidder
 		n.highestBid = req.HighestBid
-		n.bidders = req.Bidders
+		n.bidders = make(map[string]int64, len(req.Bidders))
+		for k, v := range req.Bidders {
+			n.bidders[k] = v
+		}
 		n.endTime = time.UnixMilli(req.EndUnixMillis)
 	}
 	return &pb.ReplicateResponse{Ok: true}, nil
