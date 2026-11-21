@@ -20,11 +20,13 @@ import (
 type Node struct {
 	pb.UnimplementedAuctionServer
 
-	id    int
-	peers []string // addresses of the other nodes
+	id          int
+	peers       []string // addresses of the other nodes
+	primaryAddr string
 
 	mu            sync.Mutex
 	isPrimary     bool
+	roleMu        sync.RWMutex
 	seq           int64
 	highestBidder string
 	highestBid    int64
@@ -32,20 +34,63 @@ type Node struct {
 	endTime       time.Time
 }
 
+// Helper to check if a node is primary
+
+func (n *Node) primary() bool {
+	n.roleMu.RLock()
+	defer n.roleMu.RUnlock()
+	return n.isPrimary
+}
+
 // ---------- Client-facing API ----------
 
 func (n *Node) Bid(ctx context.Context, req *pb.BidRequest) (*pb.BidResponse, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	// TODO: if this node is a backup, forward the bid to the primary
 	// (or tell the client who the primary is).
 
+	if !n.primary() {
+		conn, err := grpc.NewClient(
+			n.primaryAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+
+		if err != nil {
+			return &pb.BidResponse{
+				Outcome: pb.Outcome_EXCEPTION,
+				Message: "could not contact primary",
+			}, nil
+		}
+		defer conn.Close()
+
+		primary := pb.NewAuctionClient(conn)
+
+		resp, err := primary.Bid(ctx, req)
+		if err != nil {
+			return &pb.BidResponse{
+				Outcome: pb.Outcome_EXCEPTION,
+				Message: "primary unavailable",
+			}, nil
+		}
+
+		return resp, nil
+
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if time.Now().After(n.endTime) {
-		return &pb.BidResponse{Outcome: pb.Outcome_FAIL, Message: "auction is over"}, nil
+		return &pb.BidResponse{
+			Outcome: pb.Outcome_FAIL,
+			Message: "auction is over",
+		}, nil
 	}
 	if req.Amount <= n.highestBid {
-		return &pb.BidResponse{Outcome: pb.Outcome_FAIL, Message: "bid too low"}, nil
+		return &pb.BidResponse{
+			Outcome: pb.Outcome_FAIL,
+			Message: "bid too low",
+		}, nil
 	}
 
 	// First bid registers the bidder.
@@ -83,6 +128,19 @@ func (n *Node) replicateToBackups() {
 }
 
 func (n *Node) Result(ctx context.Context, req *pb.ResultRequest) (*pb.ResultResponse, error) {
+	if !n.primary() {
+		conn, err := grpc.NewClient(
+			n.primaryAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+
+		return pb.NewAuctionClient(conn).Result(ctx, req)
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -118,7 +176,42 @@ func (n *Node) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 	return &pb.HeartbeatResponse{PrimaryId: int32(n.id)}, nil
 }
 
-// TODO: monitorPrimary — backups periodically call Heartbeat on the
+func (n *Node) monitorPrimary() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if n.primary() {
+			return
+		}
+
+		conn, err := grpc.NewClient(
+			n.primaryAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+
+		if err != nil {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err = pb.NewAuctionClient(conn).Heartbeat(ctx, &pb.HeartbeatRequest{})
+		cancel()
+		conn.Close()
+
+		if err != nil {
+			log.Printf(" Primary is unreachable. Node %d is taking its place", n.id)
+
+			n.roleMu.Lock()
+			n.isPrimary = true
+			n.roleMu.Unlock()
+
+			return
+		}
+
+	}
+}
+
 // primary; if it doesn't answer within the known time-limit, take over.
 
 func main() {
@@ -126,13 +219,15 @@ func main() {
 	port := flag.Int("port", 50051, "port to listen on")
 	peers := flag.String("peers", "", "comma-separated addresses of other nodes, e.g. localhost:50052,localhost:50053")
 	duration := flag.Duration("duration", 100*time.Second, "how long the auction runs")
+	primary := flag.String("primary", "localhost:50051", "Address of the primary node")
 	flag.Parse()
 
 	node := &Node{
-		id:        *id,
-		isPrimary: *id == 0,
-		bidders:   make(map[string]int64),
-		endTime:   time.Now().Add(*duration),
+		id:          *id,
+		isPrimary:   *id == 0,
+		primaryAddr: *primary,
+		bidders:     make(map[string]int64),
+		endTime:     time.Now().Add(*duration),
 	}
 	if *peers != "" {
 		node.peers = strings.Split(*peers, ",")
@@ -144,6 +239,10 @@ func main() {
 	}
 	s := grpc.NewServer()
 	pb.RegisterAuctionServer(s, node)
+
+	if !node.primary() {
+		go node.monitorPrimary()
+	}
 
 	log.Printf("node %d listening on :%d (primary=%v, peers=%v)", node.id, *port, node.isPrimary, node.peers)
 	if err := s.Serve(lis); err != nil {
