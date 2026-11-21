@@ -99,13 +99,19 @@ func (n *Node) Bid(ctx context.Context, req *pb.BidRequest) (*pb.BidResponse, er
 	n.highestBidder = req.Bidder
 	n.seq++
 
-	n.replicateToBackups()
+	if !n.replicateToBackups() {
+		return &pb.BidResponse{
+			Outcome: pb.Outcome_EXCEPTION,
+			Message: "could not replicate bid to backup",
+		}, nil
+	}
+
 	return &pb.BidResponse{Outcome: pb.Outcome_SUCCESS}, nil
 }
 
 // Sends current state to all backups. A peer that doesn't answer within
 // the timeout is treated as crashed (allowed: we tolerate 1 failure).
-func (n *Node) replicateToBackups() {
+func (n *Node) replicateToBackups() bool {
 	state := &pb.ReplicateRequest{
 		Seq:           n.seq,
 		HighestBidder: n.highestBidder,
@@ -116,15 +122,25 @@ func (n *Node) replicateToBackups() {
 	for _, addr := range n.peers {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			continue
+			return false
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		if _, err := pb.NewAuctionClient(conn).Replicate(ctx, state); err != nil {
-			log.Printf("backup %s unreachable: %v", addr, err)
-		}
+		resp, err := pb.NewAuctionClient(conn).Replicate(ctx, state)
 		cancel()
 		conn.Close()
+
+		if err != nil {
+			log.Printf("backup %s unreachable: %v", addr, err)
+			return false
+		}
+
+		if !resp.Ok {
+			log.Printf("backup %s did not acknowledge replication", addr)
+			return false
+		}
 	}
+
+	return true
 }
 
 func (n *Node) Result(ctx context.Context, req *pb.ResultRequest) (*pb.ResultResponse, error) {
