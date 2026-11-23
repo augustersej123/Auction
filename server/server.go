@@ -45,10 +45,6 @@ func (n *Node) primary() bool {
 // ---------- Client-facing API ----------
 
 func (n *Node) Bid(ctx context.Context, req *pb.BidRequest) (*pb.BidResponse, error) {
-
-	// TODO: if this node is a backup, forward the bid to the primary
-	// (or tell the client who the primary is).
-
 	if !n.primary() {
 		conn, err := grpc.NewClient(
 			n.primaryAddr,
@@ -188,7 +184,6 @@ func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.Rep
 }
 
 func (n *Node) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	// TODO: return who this node believes is the primary.
 	return &pb.HeartbeatResponse{PrimaryId: int32(n.id)}, nil
 }
 
